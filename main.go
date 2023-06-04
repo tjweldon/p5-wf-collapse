@@ -148,6 +148,20 @@ func FromScreenPos(sp struct{ X, Y float64 }) Pos {
 	}
 }
 
+// Idx is an explicit implementation of the ordering implied by Next that maps directly to an index.
+// The mapping is reversible, see FromIndex.
+func (p Pos) Idx() int {
+	return p.Y*W + p.X
+}
+
+// FromIndex maps a positive integer to a Pos, it is the inverse of Pos.Idx. i.e:
+//
+//		if:		q := FromIndex(p.Idx())
+//	 then: 	p.Equals(q)  true
+func FromIndex(idx int) Pos {
+	return Pos{idx % W, idx / W}
+}
+
 // Tile is a specific state, i.e. a particular choice of PATH or NO_PATH for each side.
 // this is represented internally as an array of bools.
 type Tile struct {
@@ -193,6 +207,14 @@ type TileState struct {
 
 	// Pos is the Grid Pos for which thie TileState describes the state
 	Pos
+
+	drawConf struct {
+		freq   [_SideCount]int
+		beta   [_SideCount]float64
+		alpha  [_SideCount]uint8
+		width  [_SideCount]float64
+		cx, cy float64
+	}
 }
 
 // NewTileState initialises a TileState and uses the fact that the binary representation
@@ -213,6 +235,14 @@ func NewTileState() *TileState {
 	return &TileState{
 		Vec: v,
 		Pos: Pos{},
+		drawConf: struct {
+			freq  [_SideCount]int
+			beta  [_SideCount]float64
+			alpha [_SideCount]uint8
+			width [_SideCount]float64
+			cx    float64
+			cy    float64
+		}{},
 	}
 }
 
@@ -228,43 +258,14 @@ func (t *TileState) Draw() {
 
 	// go through all the states and count how many times each side has a path
 	maxFreq := len(t.Vec)
-	sideFreqs := [_SideCount]int{}
-	for _, tile := range t.Vec {
-		for s, active := range tile.Sides {
-			if !active {
-				continue
-			}
-			sideFreqs[s]++
-		}
-	}
-
-	// beta is a parameter that varies from 0 to 0.5, it is zero when freq is 0 and 0.5 when freq is 8.
-	beta := func(freq int) float64 {
-		return float64(freq) / 16.0
-	}
-
-	// alpha is the path line alpha value as a function of how many states in the TileState have that path fragment
-	alpha := func(freq int) uint8 {
-		start, end := 50.0, 255.0
-		return uint8(start*beta(freq) + end*(1.0-beta(freq)))
-	}
-
-	// width is the width of the path as a function of how many states in the TileState have that path fragment
-	width := func(freq int) float64 {
-		start, end := float64(NodeSize), 2.0
-		return (start*beta(freq) + end*(1.0-beta(freq)))
-	}
-
-	// cx, cy is the center of the tile
-	cx, cy := x+float64(NodeSize)/2.0, y+float64(NodeSize)/2.0
 
 	// iterating over tile sides
-	for s, frequency := range sideFreqs {
+	for s, frequency := range t.drawConf.freq {
 		// set the path fragment width
-		p5.StrokeWidth(width(frequency))
+		p5.StrokeWidth(t.drawConf.width[s])
 
 		// set the alpha level
-		p5.Stroke(color.RGBA{0, 0, 0, alpha(frequency)})
+		p5.Stroke(color.RGBA{0, 0, 0, t.drawConf.alpha[s]})
 
 		// this sets how long the frament is as a function of how likely it is that
 		// the fragment will be poplulated on observation.
@@ -273,14 +274,29 @@ func (t *TileState) Draw() {
 		dx, dy = sideChance*dx, sideChance*dy
 
 		// draw the path fragment
-		p5.Line(cx, cy, cx+dx, cy+dy)
+		p5.Line(t.drawConf.cx, t.drawConf.cy, t.drawConf.cx+dx, t.drawConf.cy+dy)
 	}
 
+}
+
+// refreshDrawConf precalculates a bunch of stuff needed for drawing when the tiles are initialised
+// and when their states change
+func (t *TileState) refreshDrawConf() {
+	for side := North; side < _SideCount; side++ {
+		freq := len(t.StatesHaving(side, true))
+		t.drawConf.freq[side] = freq
+		t.drawConf.beta[side] = float64(freq) / 16.0
+		t.drawConf.alpha[side] = uint8(50.0*t.drawConf.beta[side] + 255.0*(1.0-t.drawConf.beta[side]))
+		t.drawConf.width[side] = float64(NodeSize)*t.drawConf.beta[side] + 2.0*(1.0-t.drawConf.beta[side])
+	}
 }
 
 // PutAt is the TileState.Pos setter
 func (t *TileState) PutAt(p Pos) {
 	t.Pos = p
+	t.refreshDrawConf()
+	x, y := p.ScreenPos()
+	t.drawConf.cx, t.drawConf.cy = x+float64(NodeSize)/2.0, y+float64(NodeSize)/2.0
 }
 
 // StatesOf returns an enumeration of possible outcomes for a particular side. If it could
@@ -315,7 +331,7 @@ func (t *TileState) Entropy() float64 {
 
 // Observe is the action that causes a TileState to collapse to a single outcome. This is propagated
 // as far as it needs to be to maintain adjacency constraints.
-func (t *TileState) Observe(g Grid) {
+func (t *TileState) Observe(wf *WaveFunction) {
 	// select a state index at random
 	choice := int(p5.Random(0.0, float64(len(t.Vec))))
 
@@ -323,10 +339,10 @@ func (t *TileState) Observe(g Grid) {
 	t.Vec = []Tile{t.Vec[choice]}
 
 	// create an empty array to hold references to visited positions
-	visited := make([]*Pos, W*H)
+	visited := [W * H]bool{}
 
 	// propagate the new information into the system, culling any incompatible outcomes.
-	t.Propagate(g, visited)
+	t.Propagate(wf, visited[:])
 }
 
 // Propagate recurses through the grid, visiting each TileState at most once. It iterates through neighboring TileStates
@@ -334,27 +350,17 @@ func (t *TileState) Observe(g Grid) {
 // Propagate stops recursing when either all TileStates have been visited or when, after applying constraints to its neighboring
 // TileStates it finds that no states were culled (i.e. propagation of the collapse has provided as much information
 // about the system as it can until another observation is made).
-func (t *TileState) Propagate(g Grid, visited []*Pos) {
+func (t *TileState) Propagate(wf *WaveFunction, visited []bool) {
 	// if this node has been visited, we're done
 	isVisited := func(ts *TileState) bool {
-		for _, p := range visited {
-			if p != nil && ts.Pos.Equals(*p) {
-				return true
-			}
-		}
-		return false
+		return visited[ts.Pos.Idx()]
 	}
 	if isVisited(t) {
 		return
 	}
 
 	// add current to visited
-	for i, p := range visited {
-		if p == nil {
-			visited[i] = &t.Pos
-			break
-		}
-	}
+	visited[t.Pos.Idx()] = true
 
 	var lowestEntropyNeighbour *TileState
 	statesCulled := 0
@@ -366,8 +372,8 @@ func (t *TileState) Propagate(g Grid, visited []*Pos) {
 		}
 
 		// check that the grid has something at that position and that it hasn't been visited yet
-		neighbour, exists := g[*pos]
-		if !exists {
+		neighbour := wf.StateAt(*pos)
+		if neighbour == nil {
 			continue
 		}
 		if isVisited(neighbour) {
@@ -376,7 +382,7 @@ func (t *TileState) Propagate(g Grid, visited []*Pos) {
 
 		// constrain the neighbour's states and keep track of how many outcomes were precluded by
 		// the application of the constraints
-		statesCulled += neighbour.Constrain(g)
+		statesCulled += neighbour.Constrain(wf)
 
 		// keep track of which neighbour has the lowest Entropy
 		if lowestEntropyNeighbour == nil {
@@ -394,22 +400,22 @@ func (t *TileState) Propagate(g Grid, visited []*Pos) {
 	}
 
 	// if we could still remove possible outcomes from the system, then continue to propagate
-	lowestEntropyNeighbour.Propagate(g, visited)
+	lowestEntropyNeighbour.Propagate(wf, visited)
 }
 
 // Constrain checks the neighboring TileStates and removes any states from this instance if they
 // are incompatible with any of the states that a neighbour could resolve to on observation.
 // Constrain returns the number of states that were removed from the possible outcomes for the TileState.
-func (t *TileState) Constrain(g Grid) int {
+func (t *TileState) Constrain(wf *WaveFunction) int {
 	initial := len(t.Vec)
 	for s, pos := range t.Pos.Cardinal() {
 		if pos == nil {
 			continue
 		}
 
-		neighbour, exists := g[*pos]
+		neighbour := wf.StateAt(*pos)
 		side := Side(s)
-		if !exists {
+		if neighbour == nil {
 			continue
 		}
 
@@ -427,9 +433,14 @@ func (t *TileState) Constrain(g Grid) int {
 		// states down to only those compatible with our neighbour
 		t.Vec = t.StatesHaving(side, neighbourStates[0])
 	}
+	// refresh drawing params
+	culled := initial - len(t.Vec)
+	if culled > 0 {
+		t.refreshDrawConf()
+	}
 
 	// return the number of states culled by the application of the constraint
-	return initial - len(t.Vec)
+	return culled
 }
 
 // StatesHaving returns the subset if this TileState's outcomes as a []Tile which have the sideState outcome for the supplied side.
@@ -445,6 +456,28 @@ func (t *TileState) StatesHaving(side Side, sideState bool) []Tile {
 	return states
 }
 
+type WaveFunction struct {
+	States [W * H]*TileState
+}
+
+func (wf *WaveFunction) StateAt(p Pos) *TileState {
+	return wf.States[p.Idx()]
+}
+
+func FromGrid(g Grid) *WaveFunction {
+	wfStates := [W * H]*TileState{}
+	for idx := range wfStates {
+		pos := FromIndex(idx)
+		tileState, exists := g[pos]
+		if exists {
+			tileState.PutAt(FromIndex(idx))
+			wfStates[idx] = tileState
+		}
+	}
+
+	return &WaveFunction{States: wfStates}
+}
+
 func main() {
 	// set up the model
 	grid := MakeGridWithFactory(
@@ -452,6 +485,8 @@ func main() {
 			return NewTileState()
 		},
 	)
+
+	waveFunction := FromGrid(grid)
 
 	setup := func() {
 		// standard p5 boilerplate bs
@@ -462,12 +497,10 @@ func main() {
 	draw := func() {
 		// mouse handling for interactive collapse, implments Observe/Collapse on click
 		if p5.Event.Mouse.Pressed {
-			p := FromScreenPos(p5.Event.Mouse.Position)
-			if ts, exists := grid[p]; exists {
-
+			if p := FromScreenPos(p5.Event.Mouse.Position); p.InBounds() {
 				// only bother calling Observe if there's more than one possible outcome, i.e. it's not already collapsed
-				if len(ts.Vec) > 1 {
-					ts.Observe(grid)
+				if ts := waveFunction.StateAt(p); ts != nil && len(ts.Vec) > 1 {
+					ts.Observe(waveFunction)
 				}
 			}
 		}
