@@ -1,9 +1,14 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"image/color"
+	"log"
 	"math"
+	"os"
+	"runtime/pprof"
+	"time"
 
 	"github.com/go-p5/p5"
 )
@@ -261,6 +266,9 @@ func (t *TileState) Draw() {
 
 	// iterating over tile sides
 	for s, frequency := range t.drawConf.freq {
+		if frequency != 1 {
+			continue
+		}
 		// set the path fragment width
 		p5.StrokeWidth(t.drawConf.width[s])
 
@@ -329,6 +337,10 @@ func (t *TileState) Entropy() float64 {
 	return -math.Log(sChance)
 }
 
+func (t *TileState) IsCollapsed() bool {
+	return len(t.Vec) == 1
+}
+
 // Observe is the action that causes a TileState to collapse to a single outcome. This is propagated
 // as far as it needs to be to maintain adjacency constraints.
 func (t *TileState) Observe(wf *WaveFunction) {
@@ -337,6 +349,7 @@ func (t *TileState) Observe(wf *WaveFunction) {
 
 	// set the Vec of outocomes to only contain the choice
 	t.Vec = []Tile{t.Vec[choice]}
+	t.refreshDrawConf()
 
 	// create an empty array to hold references to visited positions
 	visited := [W * H]bool{}
@@ -478,14 +491,81 @@ func FromGrid(g Grid) *WaveFunction {
 	return &WaveFunction{States: wfStates}
 }
 
+func (wf *WaveFunction) Draw() {
+	for _, ts := range wf.States {
+		ts.Draw()
+	}
+}
+
+func (wf *WaveFunction) GetNext() *TileState {
+	var next *TileState
+	for _, ts := range wf.States {
+		if ts == nil {
+			continue
+		}
+		if ts.IsCollapsed() {
+			continue
+		}
+		if next == nil {
+			next = ts
+		} else if ts.Entropy() < next.Entropy() {
+			next = ts
+		}
+	}
+	return next
+}
+
+// Python port only needs to go up to here, can ignore all other functions from here down
+func IterOneFrom(p Pos, wf *WaveFunction) *TileState {
+	if !p.InBounds() {
+		return nil
+	}
+
+	ts := wf.StateAt(p)
+	if ts == nil {
+		return nil
+	}
+
+	if len(ts.Vec) == 0 {
+		return nil
+	}
+
+	ts.Observe(wf)
+	return wf.GetNext()
+}
+
+func RunWorker(p Pos, wf *WaveFunction) <-chan *TileState {
+	work := func(pos Pos, wavFunc *WaveFunction, out chan<- *TileState) {
+		defer close(out)
+		out <- IterOneFrom(pos, wavFunc)
+	}
+
+	c := make(chan *TileState)
+	go work(p, wf, c)
+
+	return c
+}
+
+var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+
 func main() {
+	flag.Parse()
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 	// set up the model
 	grid := MakeGridWithFactory(
 		func(p *Pos) *TileState {
 			return NewTileState()
 		},
 	)
-
+	var p *Pos
+	p = &Pos{}
 	waveFunction := FromGrid(grid)
 
 	setup := func() {
@@ -496,19 +576,15 @@ func main() {
 
 	draw := func() {
 		// mouse handling for interactive collapse, implments Observe/Collapse on click
-		if p5.Event.Mouse.Pressed {
-			if p := FromScreenPos(p5.Event.Mouse.Position); p.InBounds() {
-				// only bother calling Observe if there's more than one possible outcome, i.e. it's not already collapsed
-				if ts := waveFunction.StateAt(p); ts != nil && len(ts.Vec) > 1 {
-					ts.Observe(waveFunction)
-				}
-			}
-		}
-
 		// recursively draw the model
-		grid.Draw()
+		waveFunction.Draw()
 	}
 
 	// run the p5 process
-	p5.Run(setup, draw)
+	go p5.Run(setup, draw)
+
+	for next := waveFunction.StateAt(*p); next != nil; next = IterOneFrom(*p, waveFunction) {
+		time.Sleep(time.Second / 60)
+		p = &next.Pos
+	}
 }
